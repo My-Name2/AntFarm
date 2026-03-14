@@ -69,6 +69,7 @@ canvas{display:block}
   <span><span class="dot" style="background:#f60;border:2px solid #900"></span>Predator</span>
   <span style="color:#4af">■ Trail pheromone</span>
   <span style="color:#f44">■ Alarm pheromone</span>
+  <span style="color:#da4">■ Repellent (depleted)</span>
 </div>
 
 <canvas id="farm"></canvas>
@@ -107,6 +108,7 @@ const TRAIL_N  = 2.0;   // amplification exponent
 const TRAIL_DECAY = 0.992;  // trail lasts ~125 ticks
 const ALARM_DECAY = 0.82;   // alarm fades in ~5 ticks
 const BROOD_DECAY = 0.96;   // brood pheromone ~25 ticks
+const REPEL_DECAY = 0.985;  // repellent marks exhausted food areas (~65 tick half-life)
 
 // ═══════════════════════════════════════════════════════════════════
 //  UTILITIES
@@ -157,9 +159,9 @@ class Ant {
     this.phragmosisTimer=0;   // blocks tunnel entrance
 
     // Developmental timers
-    if      (type===AT.EGG)  { this.hatchIn=rI(55,80);  this.state=AS.IN_NEST; }
-    else if (type===AT.LARVA){ this.hatchIn=rI(90,130);  this.state=AS.IN_NEST; }
-    else if (type===AT.PUPA) { this.hatchIn=rI(70,100);  this.state=AS.IN_NEST; }
+    if      (type===AT.EGG)  { this.hatchIn=rI(55,80);  this.state=AS.IN_NEST; this.hunger=0; }
+    else if (type===AT.LARVA){ this.hatchIn=rI(90,130);  this.state=AS.IN_NEST; this.hunger=rI(20,60); }
+    else if (type===AT.PUPA) { this.hatchIn=rI(70,100);  this.state=AS.IN_NEST; this.hunger=0; }
     else if (type===AT.QUEEN){ this.state=AS.IN_NEST; this.hatchIn=0; }
     else if (type===AT.NURSE){ this.state=AS.NURSING; this.hatchIn=0; }
     else                     { this.state=AS.LEAVING; this.hatchIn=0; }
@@ -191,6 +193,7 @@ class AntFarm {
     this.trail = new Float32Array(W*H);   // foraging trail (cyan glow)
     this.alarm = new Float32Array(W*H);   // alarm (red glow)
     this.brood = new Float32Array(W*H);   // brood/larvae pheromone (attracts nurses)
+    this.repellent = new Float32Array(W*H); // marks depleted food zones (diverts foragers)
 
     // State
     this.food = new Map();   // "x,y" → quality (1-3)
@@ -335,10 +338,12 @@ class AntFarm {
       if(this.pSurf(nx,ny)) nb.push([nx,ny]);
     }
     if(!nb.length) return[ax,ay];
-    // Weight = (k + trail)^n  (Deneubourg model)
+    // Weight = (k + trail)^n / (1 + repellent)  — Deneubourg + repellent avoidance
     const weights=nb.map(([nx,ny])=>{
-      const t=this.trail[this.idx(nx,ny)];
-      return Math.pow(TRAIL_K + t, TRAIL_N);
+      const i=this.idx(nx,ny);
+      const t=this.trail[i];
+      const rep=this.repellent[i];
+      return Math.pow(TRAIL_K + t, TRAIL_N) * Math.max(0.05, 1-rep*0.035);
     });
     return weightedChoice(nb,weights);
   }
@@ -403,9 +408,14 @@ class AntFarm {
 
     // ── Brood: develop in place, emit brood pheromone ──────────────
     if(ant.type===AT.EGG||ant.type===AT.LARVA||ant.type===AT.PUPA){
-      // Emit brood pheromone to attract nurses
+      // Emit brood pheromone — larvae emit more when hungry (hunger-signalling)
       const i=this.idx(ant.x,ant.y);
-      this.brood[i]=Math.min(80, this.brood[i]+1.2);
+      if(ant.type===AT.LARVA){
+        ant.hunger=Math.min(100,(ant.hunger||0)+0.3);
+        this.brood[i]=Math.min(100, this.brood[i]+(1.0+ant.hunger*0.025));
+      } else {
+        this.brood[i]=Math.min(80, this.brood[i]+1.2);
+      }
       // Development (faster if nurse nearby)
       let nurseBonus=1;
       for(const other of this.ants){
@@ -459,10 +469,17 @@ class AntFarm {
       return;
     }
 
-    // ── Alarm sensing ─────────────────────────────────────────────
+    // ── Alarm sensing — 3-zone cascade (Oecophylla model) ─────────
     const alarmHere=this.alarm[this.idx(ant.x,ant.y)];
-    if(alarmHere>5){
+    // Soldiers detect alarm at 2x sensitivity (lower detection threshold)
+    const alarmThresh=ant.type===AT.SOLDIER?2.5:5;
+    if(alarmHere>alarmThresh){
       ant.alarmLevel=Math.min(1, ant.alarmLevel+alarmHere/80);
+    }
+    // Zone 3 (high alarm, >35): workers also release alarm — positive feedback cascade
+    if(alarmHere>35&&ant.type!==AT.SOLDIER&&ant.y<=this.GY){
+      const ai=this.idx(ant.x,ant.y);
+      this.alarm[ai]=Math.min(100, this.alarm[ai]+10);
     }
 
     // ── Flee if worker with high alarm ───────────────────────────
@@ -497,8 +514,9 @@ class AntFarm {
 
     // ── LEAVING: head from nest to surface ────────────────────────
     if(ant.state===AS.LEAVING){
-      // Slow down at night (most species are diurnal)
+      // Slow down at night; rain strongly suppresses foraging (Hölldobler & Wilson)
       if(!this.isDay()&&Math.random()<0.6) return;
+      if(this.raining&&Math.random()<0.88) return;
       [ant.x,ant.y]=this.stepTo(ant.x,ant.y,cx,GY+1,true);
       if(ant.y===GY+1&&ant.x===cx){
         ant.y=GY;
@@ -527,6 +545,9 @@ class AntFarm {
         return;
       }
 
+      // Rain: retreat immediately — ants wait inside on stored reserves
+      if(this.raining){ ant.state=AS.RETURNING; return; }
+
       // On surface: use Deneubourg trail model
       const prevX=ant.x, prevY=ant.y;
       if(Math.random()<0.15) ant.dx=rC([-1,-1,0,1,1]);
@@ -552,6 +573,9 @@ class AntFarm {
           this.food.delete(k);
           ant.hasFood=true; ant.foodQuality=q;
           ant.state=AS.RETURNING; ant.dx=-ant.dx;
+          // Deposit repellent at pickup site — marks partially-exhausted area
+          const ri=this.idx(fx,fy);
+          this.repellent[ri]=Math.min(60, this.repellent[ri]+18);
           break;
         }
       }
@@ -605,6 +629,16 @@ class AntFarm {
       [ant.x,ant.y]=[nb[0][0],nb[0][1]];
     else
       [ant.x,ant.y]=rC(nb).slice(0,2);
+
+    // Trophallaxis: feed hungry larvae from colony food reserve (social stomach)
+    for(const larva of this.ants){
+      if(larva.type===AT.LARVA&&(larva.hunger||0)>30&&
+         Math.abs(larva.x-ant.x)<=1&&Math.abs(larva.y-ant.y)<=1&&this.foodStored>0){
+        larva.hunger=Math.max(0,(larva.hunger||0)-30);
+        this.foodStored=Math.max(0,this.foodStored-0.5);
+        break;
+      }
+    }
 
     // Age polyethism: old enough nurses become foragers
     if(ant.age>60&&Math.random()<0.005){
@@ -778,12 +812,14 @@ class AntFarm {
       if(this.brood[i]<0.1) this.brood[i]=0;
       this.alarm[i]=newAlarm[i]*ALARM_DECAY;
       if(this.alarm[i]<0.1) this.alarm[i]=0;
+      this.repellent[i]*=REPEL_DECAY;
+      if(this.repellent[i]<0.1) this.repellent[i]=0;
     }
     // Rain washes surface pheromones
     if(this.raining){
       for(let x=0;x<W;x++){
         const i=this.GY*W+x;
-        this.trail[i]*=0.7; this.alarm[i]*=0.7;
+        this.trail[i]*=0.7; this.alarm[i]*=0.7; this.repellent[i]*=0.85;
       }
     }
   }
@@ -896,6 +932,12 @@ function render(farm, ctx){
       // Alarm pheromone overlay (red tint)
       const al=Math.min(1,farm.alarm[ii]/80);
       if(al>0.05){ r=Math.min(255,Math.round(r+al*140)); g=Math.round(lerp(g,0,al*0.4)); b=Math.round(lerp(b,0,al*0.4)); }
+
+      // Repellent pheromone overlay (warm yellow-ochre on surface — marks depleted areas)
+      if(cell===Cell.GRASS||cell===Cell.SKY){
+        const rep=Math.min(1,farm.repellent[ii]/50);
+        if(rep>0.08){ r=Math.min(255,Math.round(r+rep*80)); g=Math.min(255,Math.round(g+rep*45)); b=Math.round(b*Math.max(0,1-rep*0.5)); }
+      }
 
       // Brood pheromone in nursery (soft warm glow)
       if(cell===Cell.NURSERY){
