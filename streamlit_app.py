@@ -8,6 +8,7 @@ import random, time
 from dataclasses import dataclass
 from enum import Enum
 import streamlit as st
+from PIL import Image, ImageDraw
 
 # ── Cell types ────────────────────────────────────────────────────────────────
 
@@ -260,10 +261,10 @@ with st.sidebar:
 
     st.markdown("---")
     c1, c2 = st.columns(2)
-    start_btn = c1.button("▶ Start",   use_container_width=True)
-    stop_btn  = c2.button("⏹ Stop",    use_container_width=True)
-    reset_btn = st.button("🔄 Reset",  use_container_width=True)
-    food_btn  = st.button("🍎 +10 Food", use_container_width=True)
+    start_btn = c1.button("▶ Start",   width="stretch")
+    stop_btn  = c2.button("⏹ Stop",    width="stretch")
+    reset_btn = st.button("🔄 Reset",  width="stretch")
+    food_btn  = st.button("🍎 +10 Food", width="stretch")
 
     st.markdown("---")
     st.markdown("""
@@ -301,96 +302,79 @@ m5.metric("Carrying",     sum(1 for a in farm.ants if a.has_food))
 
 # ── Renderer ──────────────────────────────────────────────────────────────────
 
-# Base cell colours
-SKY_TOP    = (135, 206, 235)   # light sky blue
-SKY_BOT    = (180, 220, 245)   # near ground, lighter
+SCALE = 10   # pixels per cell
+
+SKY_TOP    = (135, 206, 235)
+SKY_BOT    = (176, 226, 250)
 GRASS_COL  = (60,  160,  50)
 DIRT_COL   = (101,  67,  33)
-TUNNEL_COL = (35,   20,  10)
-NEST_COL   = (160, 120,  30)
-FOOD_COL   = "#FF3B30"
-ANT_S_COL  = "#111111"
-ANT_C_COL  = "#FFD700"
+TUNNEL_COL = (30,   16,   6)
+NEST_COL   = (160, 110,  20)
+ANT_S_COL  = (10,   10,  10)
+ANT_C_COL  = (255, 215,   0)
+FOOD_COL   = (255,  50,  30)
 
 
-def lerp_colour(c1, c2, t):
+def lerp(c1, c2, t):
     return tuple(int(a + (b - a) * t) for a, b in zip(c1, c2))
 
 
-def rgb(r, g, b):
-    return f"#{int(r):02x}{int(g):02x}{int(b):02x}"
+def render_frame(farm: AntFarm) -> Image.Image:
+    W, H, GY = farm.W, farm.H, farm.GROUND_Y
+    img = Image.new("RGB", (W * SCALE, H * SCALE))
+    draw = ImageDraw.Draw(img)
 
-
-def build_html(farm: AntFarm) -> str:
-    # Build ant lookup: pos → carrying?
     ant_map: dict[tuple[int,int], bool] = {}
     for ant in farm.ants:
-        key = (ant.x, ant.y)
-        ant_map[key] = ant_map.get(key, False) or ant.has_food
+        ant_map[(ant.x, ant.y)] = ant_map.get((ant.x, ant.y), False) or ant.has_food
 
-    cell_px = max(7, min(13, 900 // farm.W))
-    font_px = max(5, cell_px - 2)
-    GY = farm.GROUND_Y
-
-    rows = []
-    for gy in range(farm.H):
-        cells = []
-        for gx in range(farm.W):
+    for gy in range(H):
+        for gx in range(W):
             ctype = farm.grid[gy][gx]
-            key   = (gx, gy)
 
-            # Background colour
             if ctype == Cell.SKY:
-                t  = gy / max(1, GY)
-                bg = rgb(*lerp_colour(SKY_TOP, SKY_BOT, t))
+                col = lerp(SKY_TOP, SKY_BOT, gy / max(1, GY))
             elif ctype == Cell.GRASS:
-                # Slight texture variation
-                v  = int(60 + (gx * 7 + gy * 3) % 20)
-                bg = rgb(30, v + 80, 30)
+                v   = (gx * 7 + gy * 3) % 20
+                col = (30, 140 + v, 30)
             elif ctype == Cell.DIRT:
-                s  = farm._dirt_shade[gy][gx]
-                bg = rgb(*(min(255, int(c * s)) for c in DIRT_COL))
+                s   = farm._dirt_shade[gy][gx]
+                col = tuple(min(255, int(c * s)) for c in DIRT_COL)
             elif ctype == Cell.TUNNEL:
-                bg = rgb(*TUNNEL_COL)
+                col = TUNNEL_COL
             elif ctype == Cell.NEST:
-                s  = 0.9 + 0.2 * ((gx + gy) % 2)
-                bg = rgb(*(min(255, int(c * s)) for c in NEST_COL))
+                s   = 0.88 + 0.24 * ((gx + gy) % 2)
+                col = tuple(min(255, int(c * s)) for c in NEST_COL)
             else:
-                bg = "#000"
+                col = (0, 0, 0)
 
-            # Foreground content
-            if key in ant_map:
-                ch = "●"
-                fg = ANT_C_COL if ant_map[key] else ANT_S_COL
-            elif key in farm.food:
-                ch = "●"
-                fg = FOOD_COL
-            elif ctype == Cell.GRASS:
-                # Draw little grass blades every few columns
-                ch = "|" if gx % 4 == 0 else " "
-                fg = rgb(20, 200, 20)
-            else:
-                ch = " "
-                fg = "#000"
+            x0, y0 = gx * SCALE, gy * SCALE
+            x1, y1 = x0 + SCALE - 1, y0 + SCALE - 1
+            draw.rectangle([x0, y0, x1, y1], fill=col)
 
-            cells.append(
-                f'<td style="background:{bg};color:{fg};width:{cell_px}px;'
-                f'height:{cell_px}px;font-size:{font_px}px;text-align:center;'
-                f'vertical-align:middle;padding:0;line-height:1;">{ch}</td>'
-            )
-        rows.append("<tr>" + "".join(cells) + "</tr>")
+            # Grass blades
+            if ctype == Cell.GRASS and gx % 3 == 0:
+                draw.line([x0 + SCALE//2, y0, x0 + SCALE//2, y0 + SCALE - 2],
+                          fill=(40, 200, 40), width=1)
 
-    table = (
-        '<table style="border-collapse:collapse;margin:0 auto;'
-        'border:2px solid #555;">'
-        + "".join(rows)
-        + "</table>"
-    )
-    return f'<div style="overflow:auto;">{table}</div>'
+            # Food
+            if (gx, gy) in farm.food:
+                cx, cy = x0 + SCALE//2, y0 + SCALE//2
+                r = max(2, SCALE // 3)
+                draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=FOOD_COL)
+
+            # Ants
+            if (gx, gy) in ant_map:
+                cx, cy = x0 + SCALE//2, y0 + SCALE//2
+                r = max(2, SCALE // 3)
+                acol = ANT_C_COL if ant_map[(gx, gy)] else ANT_S_COL
+                draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=acol)
+
+    return img
 
 
 grid_slot = st.empty()
-grid_slot.markdown(build_html(farm), unsafe_allow_html=True)
+grid_slot.image(render_frame(farm), width="stretch")
 
 # ── Loop ──────────────────────────────────────────────────────────────────────
 
@@ -398,5 +382,5 @@ if st.session_state.running:
     for _ in range(speed):
         farm.update()
     time.sleep(0.35)
-    grid_slot.markdown(build_html(farm), unsafe_allow_html=True)
+    grid_slot.image(render_frame(farm), width="stretch")
     st.rerun()
