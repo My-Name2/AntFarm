@@ -256,7 +256,7 @@ with st.sidebar:
     food_count = st.slider("Starting food",     5,  60, 25)
     grid_w     = st.slider("Width",            50, 140, 90)
     grid_h     = st.slider("Height",           30,  80, 50)
-    speed      = st.slider("Speed (ticks/frame)", 1, 10, 2)
+    speed      = st.slider("Speed (ticks/frame)", 1, 10, 1)
 
     st.markdown("---")
     c1, c2 = st.columns(2)
@@ -397,6 +397,6 @@ grid_slot.markdown(build_html(farm), unsafe_allow_html=True)
 if st.session_state.running:
     for _ in range(speed):
         farm.update()
-    time.sleep(0.06)
+    time.sleep(0.35)
     grid_slot.markdown(build_html(farm), unsafe_allow_html=True)
     st.rerun()
