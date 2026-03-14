@@ -1,388 +1,359 @@
 """
 Ant Farm – Side View
-Streamlit app showing a cross-section of an ant colony.
+All simulation and rendering runs in the browser via JS canvas.
+No per-frame network traffic → zero flicker.
 Run with:  streamlit run streamlit_app.py
 """
-
-import random
-from dataclasses import dataclass
-from enum import Enum
 import streamlit as st
-from PIL import Image, ImageDraw
-
-# ── Cell types ────────────────────────────────────────────────────────────────
-
-class Cell(Enum):
-    SKY    = 0
-    GRASS  = 1   # ground surface row
-    DIRT   = 2   # solid underground
-    TUNNEL = 3   # excavated passage
-    NEST   = 4   # colony chamber
-
-# ── Ant states ────────────────────────────────────────────────────────────────
-
-class AntState(Enum):
-    LEAVING   = "leaving"    # underground, heading up to surface
-    FORAGING  = "foraging"   # on surface, hunting for food
-    RETURNING = "returning"  # carrying food, heading back underground
-    IN_NEST   = "in_nest"    # depositing food, then leaving again
-
-# ── Ant ───────────────────────────────────────────────────────────────────────
-
-@dataclass
-class Ant:
-    x: int
-    y: int
-    state: AntState = AntState.LEAVING
-    has_food: bool  = False
-    dx: int         = 1   # surface walk direction
-
-# ── World ─────────────────────────────────────────────────────────────────────
-
-class AntFarm:
-    def __init__(self, width: int, height: int, ant_count: int, food_count: int):
-        self.W, self.H   = width, height
-        self.GROUND_Y    = max(5, height // 6)
-        self.grid        = [[Cell.SKY] * width for _ in range(height)]
-        self.food: set[tuple[int,int]] = set()
-        self.food_stored = 0
-        self.tick        = 0
-        self.ants: list[Ant] = []
-        self._build_world()
-        self._spawn_food(food_count)
-        self._spawn_ants(ant_count)
-
-    # ── World building ────────────────────────────────────────────────────────
-
-    def _build_world(self):
-        W, H, GY = self.W, self.H, self.GROUND_Y
-        cx = W // 2
-        self.cx     = cx
-        self.nest_y = GY + max(8, (H - GY) // 3)
-
-        # Underground → DIRT
-        for y in range(GY, H):
-            for x in range(W):
-                self.grid[y][x] = Cell.DIRT
-
-        # Grass surface line
-        for x in range(W):
-            self.grid[GY][x] = Cell.GRASS
-
-        # Nest chamber
-        for dy in range(-2, 3):
-            for dx in range(-6, 7):
-                ny, nx = self.nest_y + dy, cx + dx
-                if GY < ny < H and 0 <= nx < W:
-                    self.grid[ny][nx] = Cell.NEST
-
-        # Main entrance shaft (vertical, centred)
-        for y in range(GY + 1, self.nest_y - 2):
-            self.grid[y][cx] = Cell.TUNNEL
-
-        # Horizontal tunnels left/right from nest
-        branch = W // 4
-        for dx in range(1, branch + 1):
-            for bx in [cx - dx, cx + dx]:
-                if 0 <= bx < W:
-                    self.grid[self.nest_y][bx] = Cell.TUNNEL
-
-        # Secondary shafts + small chambers at branch ends
-        for bx in [cx - branch, cx + branch]:
-            if 0 <= bx < W:
-                for dy in range(1, 5):
-                    ny = self.nest_y + dy
-                    if ny < H:
-                        self.grid[ny][bx] = Cell.TUNNEL
-                for ddx in range(-2, 3):
-                    sx = bx + ddx
-                    ny = min(H - 1, self.nest_y + 4)
-                    if 0 <= sx < W:
-                        self.grid[ny][sx] = Cell.TUNNEL
-
-        # Random rock texture variation stored as a float overlay (for colour only)
-        self._dirt_shade = [
-            [random.uniform(0.85, 1.15) for _ in range(W)]
-            for _ in range(H)
-        ]
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _ok(self, x: int, y: int) -> bool:
-        return 0 <= x < self.W and 0 <= y < self.H
-
-    def _passable_surface(self, x: int, y: int) -> bool:
-        return self._ok(x, y) and self.grid[y][x] in (Cell.SKY, Cell.GRASS)
-
-    def _passable_underground(self, x: int, y: int) -> bool:
-        return self._ok(x, y) and self.grid[y][x] in (Cell.TUNNEL, Cell.NEST)
-
-    def _step_toward(self, ax, ay, tx, ty, *, underground: bool) -> tuple[int, int]:
-        """One-step greedy move toward (tx, ty) through passable cells."""
-        passable = self._passable_underground if underground else self._passable_surface
-        ddx = 0 if ax == tx else (1 if tx > ax else -1)
-        ddy = 0 if ay == ty else (1 if ty > ay else -1)
-
-        # Ordered candidates: diagonal first, then axis-aligned, then perpendicular
-        options = [
-            (ax + ddx, ay + ddy),
-            (ax + ddx, ay),
-            (ax,       ay + ddy),
-            (ax - ddy, ay + ddx),
-            (ax + ddy, ay - ddx),
-        ]
-        for nx, ny in options:
-            if passable(nx, ny):
-                return nx, ny
-
-        # Fallback: any passable neighbour
-        nbrs = [(ax+dx, ay+dy) for dx in (-1,0,1) for dy in (-1,0,1)
-                if (dx or dy) and passable(ax+dx, ay+dy)]
-        if nbrs:
-            return random.choice(nbrs)
-        return ax, ay
-
-    # ── Spawning ──────────────────────────────────────────────────────────────
-
-    def _spawn_food(self, n: int):
-        placed = tries = 0
-        while placed < n and tries < n * 40:
-            tries += 1
-            x = random.randint(0, self.W - 1)
-            y = random.randint(0, self.GROUND_Y - 1)
-            if (x, y) not in self.food:
-                self.food.add((x, y))
-                placed += 1
-
-    def _spawn_ants(self, n: int):
-        for _ in range(n):
-            x = max(0, min(self.W-1, self.cx + random.randint(-4, 4)))
-            y = max(0, min(self.H-1, self.nest_y + random.randint(-1, 1)))
-            self.ants.append(Ant(x=x, y=y, state=AntState.LEAVING,
-                                 dx=random.choice([-1, 1])))
-
-    # ── Ant logic ─────────────────────────────────────────────────────────────
-
-    def _move_ant(self, ant: Ant):
-        GY = self.GROUND_Y
-
-        if ant.state == AntState.LEAVING:
-            # Target one cell below grass (GY+1 = top of tunnel), then emerge
-            ant.x, ant.y = self._step_toward(ant.x, ant.y, self.cx, GY + 1,
-                                             underground=True)
-            if ant.y == GY + 1 and ant.x == self.cx:
-                ant.y   = GY          # step onto grass
-                ant.state = AntState.FORAGING
-                ant.dx    = random.choice([-1, 1])
-
-        elif ant.state == AntState.FORAGING:
-            # Wander the surface
-            if random.random() < 0.2:
-                ant.dx = random.choice([-1, -1, 1, 1, 0])
-            ny = GY if random.random() > 0.35 else max(0, GY - random.randint(1, 3))
-            nx = max(0, min(self.W - 1, ant.x + ant.dx))
-            if self._passable_surface(nx, ny):
-                ant.x, ant.y = nx, ny
-            # Bounce off edges
-            if ant.x in (0, self.W - 1):
-                ant.dx = -ant.dx
-
-            # Grab nearby food
-            for fx, fy in list(self.food):
-                if abs(fx - ant.x) <= 1 and abs(fy - ant.y) <= 1:
-                    self.food.discard((fx, fy))
-                    ant.has_food = True
-                    ant.state    = AntState.RETURNING
-                    ant.dx       = -ant.dx
-                    break
-
-        elif ant.state == AntState.RETURNING:
-            if ant.y <= GY:
-                # On surface: walk toward entrance column then descend
-                ant.x, ant.y = self._step_toward(ant.x, ant.y, self.cx, GY,
-                                                 underground=False)
-                if ant.x == self.cx and ant.y == GY:
-                    ant.y = GY + 1    # step into tunnel
-            else:
-                # Underground: head to nest
-                ant.x, ant.y = self._step_toward(ant.x, ant.y, self.cx, self.nest_y,
-                                                 underground=True)
-                if self.grid[ant.y][ant.x] == Cell.NEST:
-                    ant.state    = AntState.IN_NEST
-                    ant.has_food = False
-                    self.food_stored += 1
-
-        elif ant.state == AntState.IN_NEST:
-            # Rest briefly in nest, then leave again
-            if random.random() < 0.15:
-                ant.state = AntState.LEAVING
-
-    # ── Digging ───────────────────────────────────────────────────────────────
-
-    def _dig(self):
-        """Randomly extend tunnels from existing tunnel edges."""
-        if random.random() > 0.04:
-            return
-        # Sample a random underground position
-        y = random.randint(self.GROUND_Y + 1, self.H - 2)
-        x = random.randint(1, self.W - 2)
-        if self.grid[y][x] not in (Cell.TUNNEL, Cell.NEST):
-            return
-        dirs = [(1, 0), (-1, 0), (0, 1)]  # sides and down, not up
-        random.shuffle(dirs)
-        for dx, dy in dirs:
-            nx, ny = x + dx, y + dy
-            if self._ok(nx, ny) and self.grid[ny][nx] == Cell.DIRT:
-                self.grid[ny][nx] = Cell.TUNNEL
-                return
-
-    # ── Update ────────────────────────────────────────────────────────────────
-
-    def update(self):
-        self.tick += 1
-        for ant in self.ants:
-            self._move_ant(ant)
-        self._dig()
-        if self.tick % 60 == 0:
-            self._spawn_food(3)
-
-
-# ── Streamlit UI ──────────────────────────────────────────────────────────────
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Ant Farm", page_icon="🐜", layout="wide")
+st.title("🐜 Ant Farm")
 
-with st.sidebar:
-    st.title("🐜 Ant Farm")
-    ant_count  = st.slider("Ants",              5,  60, 20)
-    food_count = st.slider("Starting food",     5,  60, 25)
-    grid_w     = st.slider("Width",            50, 140, 90)
-    grid_h     = st.slider("Height",           30,  80, 50)
-    speed      = st.slider("Speed (ticks/frame)", 1, 10, 1)
+components.html("""
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #111; color: #eee; font-family: monospace; }
+  #ui {
+    display: flex; align-items: center; flex-wrap: wrap;
+    gap: 10px; padding: 8px 12px; background: #1a1a1a;
+    border-bottom: 1px solid #333;
+  }
+  #ui label { font-size: 12px; color: #aaa; }
+  #ui input[type=range] { width: 90px; }
+  #ui span { font-size: 12px; color: #fff; min-width: 24px; display:inline-block; }
+  button {
+    padding: 5px 12px; border: none; border-radius: 4px;
+    cursor: pointer; font-size: 13px; font-weight: bold;
+  }
+  #btnStart  { background: #2a9; color: #fff; }
+  #btnStop   { background: #a44; color: #fff; }
+  #btnReset  { background: #555; color: #fff; }
+  #btnFood   { background: #a72; color: #fff; }
+  #stats {
+    display: flex; gap: 20px; padding: 6px 12px;
+    background: #161616; border-bottom: 1px solid #333; font-size: 13px;
+  }
+  #stats span { color: #8cf; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
 
-    st.markdown("---")
-    c1, c2 = st.columns(2)
-    start_btn = c1.button("▶ Start",   width="stretch")
-    stop_btn  = c2.button("⏹ Stop",    width="stretch")
-    reset_btn = st.button("🔄 Reset",  width="stretch")
-    food_btn  = st.button("🍎 +10 Food", width="stretch")
+<div id="ui">
+  <label>Ants <span id="vAnts">20</span></label>
+  <input type="range" id="sAnts" min="5" max="60" value="20">
 
-    st.markdown("---")
-    st.markdown("""
-**Legend**
-- 🟦 Sky
-- 🟩 Grass surface
-- 🟫 Dirt (solid)
-- ⬛ Tunnel (open)
-- 🟨 Nest chamber
-- 🔴 Food
-- ⚫ Ant (searching)
-- 🟡 Ant (carrying food)
-""")
+  <label>Food <span id="vFood">25</span></label>
+  <input type="range" id="sFood" min="5" max="80" value="25">
 
-# ── Session state ─────────────────────────────────────────────────────────────
+  <label>Width <span id="vW">100</span></label>
+  <input type="range" id="sW" min="50" max="160" value="100">
 
-if "farm" not in st.session_state or reset_btn:
-    st.session_state.farm    = AntFarm(grid_w, grid_h, ant_count, food_count)
-    st.session_state.running = False
+  <label>Height <span id="vH">55</span></label>
+  <input type="range" id="sH" min="30" max="90" value="55">
 
-if start_btn: st.session_state.running = True
-if stop_btn:  st.session_state.running = False
-if food_btn:  st.session_state.farm._spawn_food(10)
+  <label>Speed <span id="vSpeed">1</span>x</label>
+  <input type="range" id="sSpeed" min="1" max="8" value="1">
 
-# Store speed in session state so the fragment can read it
-st.session_state.speed = speed
+  <button id="btnStart">▶ Start</button>
+  <button id="btnStop">⏹ Stop</button>
+  <button id="btnReset">🔄 Reset</button>
+  <button id="btnFood">🍎 +Food</button>
+</div>
 
-farm: AntFarm = st.session_state.farm
+<div id="stats">
+  Tick: <span id="sTick">0</span>
+  &nbsp;|&nbsp; Food stored: <span id="sStored">0</span>
+  &nbsp;|&nbsp; On surface: <span id="sSurface">0</span>
+  &nbsp;|&nbsp; Carrying: <span id="sCarrying">0</span>
+</div>
 
-# ── Renderer ──────────────────────────────────────────────────────────────────
+<canvas id="farm"></canvas>
 
-SCALE = 10   # pixels per cell
+<script>
+// ── Enums ────────────────────────────────────────────────────────────────────
+const Cell = Object.freeze({SKY:0, GRASS:1, DIRT:2, TUNNEL:3, NEST:4});
+const AS   = Object.freeze({LEAVING:0, FORAGING:1, RETURNING:2, IN_NEST:3});
 
-SKY_TOP    = (135, 206, 235)
-SKY_BOT    = (176, 226, 250)
-GRASS_COL  = (60,  160,  50)
-DIRT_COL   = (101,  67,  33)
-TUNNEL_COL = (30,   16,   6)
-NEST_COL   = (160, 110,  20)
-ANT_S_COL  = (10,   10,  10)
-ANT_C_COL  = (255, 215,   0)
-FOOD_COL   = (255,  50,  30)
+// ── Helpers ──────────────────────────────────────────────────────────────────
+const rI = (a,b) => Math.floor(Math.random()*(b-a+1))+a;
+const rC = a => a[Math.floor(Math.random()*a.length)];
 
+// ── Ant ──────────────────────────────────────────────────────────────────────
+class Ant {
+  constructor(x,y) {
+    this.x=x; this.y=y;
+    this.state=AS.LEAVING; this.hasFood=false;
+    this.dx=rC([-1,1]); this.dy=0;
+  }
+}
 
-def lerp(c1, c2, t):
-    return tuple(int(a + (b - a) * t) for a, b in zip(c1, c2))
+// ── World ────────────────────────────────────────────────────────────────────
+class AntFarm {
+  constructor(W, H, antCount, foodCount) {
+    this.W=W; this.H=H;
+    this.GY = Math.max(5, Math.floor(H/6));
+    this.grid = Array.from({length:H}, ()=>new Uint8Array(W));
+    this.food = new Set();
+    this.foodStored=0; this.tick=0;
+    this.ants=[];
+    this.shade = Array.from({length:H}, ()=>
+      Float32Array.from({length:W}, ()=>0.85+Math.random()*0.3));
+    this.build();
+    this.spawnFood(foodCount);
+    this.spawnAnts(antCount);
+  }
 
+  build() {
+    const {W,H,GY} = this;
+    const cx = Math.floor(W/2);
+    this.cx  = cx;
+    this.nestY = GY + Math.max(8, Math.floor((H-GY)/3));
 
-def render_frame(farm: AntFarm) -> Image.Image:
-    W, H, GY = farm.W, farm.H, farm.GROUND_Y
-    img = Image.new("RGB", (W * SCALE, H * SCALE))
-    draw = ImageDraw.Draw(img)
+    for (let y=GY; y<H; y++)
+      for (let x=0; x<W; x++) this.grid[y][x]=Cell.DIRT;
+    for (let x=0; x<W; x++) this.grid[GY][x]=Cell.GRASS;
 
-    ant_map: dict[tuple[int,int], bool] = {}
-    for ant in farm.ants:
-        ant_map[(ant.x, ant.y)] = ant_map.get((ant.x, ant.y), False) or ant.has_food
+    // Nest chamber
+    for (let dy=-2; dy<=2; dy++)
+      for (let dx=-6; dx<=6; dx++) {
+        const ny=this.nestY+dy, nx=cx+dx;
+        if (ny>GY && ny<H && nx>=0 && nx<W) this.grid[ny][nx]=Cell.NEST;
+      }
 
-    for gy in range(H):
-        for gx in range(W):
-            ctype = farm.grid[gy][gx]
+    // Main shaft
+    for (let y=GY+1; y<this.nestY-2; y++) this.grid[y][cx]=Cell.TUNNEL;
 
-            if ctype == Cell.SKY:
-                col = lerp(SKY_TOP, SKY_BOT, gy / max(1, GY))
-            elif ctype == Cell.GRASS:
-                v   = (gx * 7 + gy * 3) % 20
-                col = (30, 140 + v, 30)
-            elif ctype == Cell.DIRT:
-                s   = farm._dirt_shade[gy][gx]
-                col = tuple(min(255, int(c * s)) for c in DIRT_COL)
-            elif ctype == Cell.TUNNEL:
-                col = TUNNEL_COL
-            elif ctype == Cell.NEST:
-                s   = 0.88 + 0.24 * ((gx + gy) % 2)
-                col = tuple(min(255, int(c * s)) for c in NEST_COL)
-            else:
-                col = (0, 0, 0)
+    // Horizontal branches
+    const br = Math.floor(W/4);
+    for (let dx=1; dx<=br; dx++) {
+      if (cx-dx>=0) this.grid[this.nestY][cx-dx]=Cell.TUNNEL;
+      if (cx+dx<W)  this.grid[this.nestY][cx+dx]=Cell.TUNNEL;
+    }
 
-            x0, y0 = gx * SCALE, gy * SCALE
-            x1, y1 = x0 + SCALE - 1, y0 + SCALE - 1
-            draw.rectangle([x0, y0, x1, y1], fill=col)
+    // Side chambers
+    for (const bx of [cx-br, cx+br]) {
+      if (bx<0||bx>=W) continue;
+      for (let dy=1; dy<=4; dy++) { const ny=this.nestY+dy; if(ny<H) this.grid[ny][bx]=Cell.TUNNEL; }
+      for (let ddx=-2; ddx<=2; ddx++) {
+        const sx=bx+ddx, ny=Math.min(H-1,this.nestY+4);
+        if (sx>=0&&sx<W) this.grid[ny][sx]=Cell.TUNNEL;
+      }
+    }
+  }
 
-            # Grass blades
-            if ctype == Cell.GRASS and gx % 3 == 0:
-                draw.line([x0 + SCALE//2, y0, x0 + SCALE//2, y0 + SCALE - 2],
-                          fill=(40, 200, 40), width=1)
+  inB(x,y)  { return x>=0&&x<this.W&&y>=0&&y<this.H; }
+  pSurf(x,y){ return this.inB(x,y)&&(this.grid[y][x]===Cell.SKY||this.grid[y][x]===Cell.GRASS); }
+  pUnder(x,y){ return this.inB(x,y)&&(this.grid[y][x]===Cell.TUNNEL||this.grid[y][x]===Cell.NEST); }
 
-            # Food
-            if (gx, gy) in farm.food:
-                cx, cy = x0 + SCALE//2, y0 + SCALE//2
-                r = max(2, SCALE // 3)
-                draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=FOOD_COL)
+  stepTo(ax,ay,tx,ty,under) {
+    const ok = under ? (x,y)=>this.pUnder(x,y) : (x,y)=>this.pSurf(x,y);
+    const ddx = ax===tx?0:(tx>ax?1:-1);
+    const ddy = ay===ty?0:(ty>ay?1:-1);
+    for (const [nx,ny] of [[ax+ddx,ay+ddy],[ax+ddx,ay],[ax,ay+ddy],[ax-ddy,ay+ddx],[ax+ddy,ay-ddx]])
+      if (ok(nx,ny)) return [nx,ny];
+    const nb=[];
+    for (let dx=-1;dx<=1;dx++) for(let dy=-1;dy<=1;dy++)
+      if((dx||dy)&&ok(ax+dx,ay+dy)) nb.push([ax+dx,ay+dy]);
+    return nb.length ? rC(nb) : [ax,ay];
+  }
 
-            # Ants
-            if (gx, gy) in ant_map:
-                cx, cy = x0 + SCALE//2, y0 + SCALE//2
-                r = max(2, SCALE // 3)
-                acol = ANT_C_COL if ant_map[(gx, gy)] else ANT_S_COL
-                draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=acol)
+  spawnFood(n) {
+    let placed=0, tries=0;
+    while (placed<n && tries<n*40) {
+      tries++;
+      const x=rI(0,this.W-1), y=rI(0,this.GY-1), k=x+','+y;
+      if (!this.food.has(k)) { this.food.add(k); placed++; }
+    }
+  }
 
-    return img
+  spawnAnts(n) {
+    for (let i=0;i<n;i++) {
+      const x=Math.max(0,Math.min(this.W-1,this.cx+rI(-4,4)));
+      const y=Math.max(0,Math.min(this.H-1,this.nestY+rI(-1,1)));
+      this.ants.push(new Ant(x,y));
+    }
+  }
 
+  moveAnt(ant) {
+    const GY=this.GY;
+    if (ant.state===AS.LEAVING) {
+      [ant.x,ant.y]=this.stepTo(ant.x,ant.y,this.cx,GY+1,true);
+      if (ant.y===GY+1&&ant.x===this.cx) { ant.y=GY; ant.state=AS.FORAGING; ant.dx=rC([-1,1]); }
 
-# ── Simulation fragment (auto-refreshes without WebSocket spam) ───────────────
+    } else if (ant.state===AS.FORAGING) {
+      if (Math.random()<0.2) ant.dx=rC([-1,-1,0,1,1]);
+      const ny=Math.random()>0.35?GY:Math.max(0,GY-rI(1,3));
+      const nx=Math.max(0,Math.min(this.W-1,ant.x+ant.dx));
+      if (this.pSurf(nx,ny)){ant.x=nx;ant.y=ny;}
+      if (ant.x===0||ant.x===this.W-1) ant.dx=-ant.dx;
+      for (const k of this.food) {
+        const [fx,fy]=k.split(',').map(Number);
+        if (Math.abs(fx-ant.x)<=1&&Math.abs(fy-ant.y)<=1) {
+          this.food.delete(k); ant.hasFood=true; ant.state=AS.RETURNING; ant.dx=-ant.dx; break;
+        }
+      }
 
-@st.fragment(run_every=0.35)
-def simulation_view():
-    farm = st.session_state.farm
-    if st.session_state.get("running"):
-        spd = st.session_state.get("speed", 1)
-        for _ in range(spd):
-            farm.update()
+    } else if (ant.state===AS.RETURNING) {
+      if (ant.y<=GY) {
+        [ant.x,ant.y]=this.stepTo(ant.x,ant.y,this.cx,GY,false);
+        if (ant.x===this.cx&&ant.y===GY) ant.y=GY+1;
+      } else {
+        [ant.x,ant.y]=this.stepTo(ant.x,ant.y,this.cx,this.nestY,true);
+        if (this.grid[ant.y][ant.x]===Cell.NEST) { ant.state=AS.IN_NEST; ant.hasFood=false; this.foodStored++; }
+      }
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Tick",            farm.tick)
-    m2.metric("Ants",            len(farm.ants))
-    m3.metric("Food stored",     farm.food_stored)
-    m4.metric("Food on surface", len(farm.food))
-    m5.metric("Carrying",        sum(1 for a in farm.ants if a.has_food))
-    st.image(render_frame(farm), width="stretch")
+    } else if (ant.state===AS.IN_NEST) {
+      if (Math.random()<0.15) ant.state=AS.LEAVING;
+    }
+  }
 
-simulation_view()
+  dig() {
+    if (Math.random()>0.04) return;
+    const y=rI(this.GY+1,this.H-2), x=rI(1,this.W-2);
+    if (this.grid[y][x]!==Cell.TUNNEL&&this.grid[y][x]!==Cell.NEST) return;
+    for (const [dx,dy] of [[1,0],[-1,0],[0,1]].sort(()=>Math.random()-.5)) {
+      const nx=x+dx, ny=y+dy;
+      if (this.inB(nx,ny)&&this.grid[ny][nx]===Cell.DIRT) { this.grid[ny][nx]=Cell.TUNNEL; return; }
+    }
+  }
+
+  update() {
+    this.tick++;
+    for (const ant of this.ants) this.moveAnt(ant);
+    this.dig();
+    if (this.tick%60===0) this.spawnFood(3);
+  }
+}
+
+// ── Renderer ─────────────────────────────────────────────────────────────────
+const SCALE = 10;
+
+function render(farm, ctx) {
+  const {W,H,GY} = farm;
+  const iw=W*SCALE, ih=H*SCALE;
+  const img = ctx.createImageData(iw, ih);
+  const d   = img.data;
+
+  const antMap = new Map();
+  for (const ant of farm.ants) {
+    const k=ant.x+','+ant.y;
+    antMap.set(k, (antMap.get(k)||false)||ant.hasFood);
+  }
+
+  for (let gy=0; gy<H; gy++) {
+    for (let gx=0; gx<W; gx++) {
+      const cell = farm.grid[gy][gx];
+      let r,g,b;
+
+      if (cell===Cell.SKY) {
+        const t=gy/Math.max(1,GY);
+        r=135+Math.round(41*t); g=206+Math.round(20*t); b=235+Math.round(15*t);
+      } else if (cell===Cell.GRASS) {
+        const v=(gx*7+gy*3)%20; r=30; g=140+v; b=30;
+      } else if (cell===Cell.DIRT) {
+        const s=farm.shade[gy][gx];
+        r=Math.min(255,101*s|0); g=Math.min(255,67*s|0); b=Math.min(255,33*s|0);
+      } else if (cell===Cell.TUNNEL) {
+        r=30; g=16; b=6;
+      } else { // NEST
+        const s=0.88+0.24*((gx+gy)%2);
+        r=Math.min(255,160*s|0); g=Math.min(255,110*s|0); b=Math.min(255,20*s|0);
+      }
+
+      const k=gx+','+gy;
+      const hasAnt=antMap.has(k);
+      const hasFood=farm.food.has(k);
+      const carrying=hasAnt&&antMap.get(k);
+      const dotR2=Math.pow(Math.max(2,SCALE/3),2);
+      const cx2=SCALE/2-0.5, cy2=SCALE/2-0.5;
+
+      for (let sy=0; sy<SCALE; sy++) {
+        for (let sx=0; sx<SCALE; sx++) {
+          const dist2=(sx-cx2)*(sx-cx2)+(sy-cy2)*(sy-cy2);
+          const base=(gy*SCALE+sy)*iw+(gx*SCALE+sx);
+          const i=base*4;
+
+          if ((hasAnt||hasFood) && dist2<=dotR2) {
+            if (hasAnt)       { d[i]=carrying?255:15; d[i+1]=carrying?215:15; d[i+2]=carrying?0:15; }
+            else if (hasFood) { d[i]=255; d[i+1]=50; d[i+2]=30; }
+          } else if (cell===Cell.GRASS && sx===SCALE/2|0 && gx%3===0 && sy<SCALE-1) {
+            d[i]=40; d[i+1]=200; d[i+2]=40;
+          } else {
+            d[i]=r; d[i+1]=g; d[i+2]=b;
+          }
+          d[i+3]=255;
+        }
+      }
+    }
+  }
+  ctx.putImageData(img,0,0);
+}
+
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('farm');
+const ctx    = canvas.getContext('2d');
+let farm, running=false, speed=1;
+
+function getConfig() {
+  return {
+    W:    +document.getElementById('sW').value,
+    H:    +document.getElementById('sH').value,
+    ants: +document.getElementById('sAnts').value,
+    food: +document.getElementById('sFood').value,
+  };
+}
+
+function reset() {
+  const c=getConfig();
+  canvas.width  = c.W*SCALE;
+  canvas.height = c.H*SCALE;
+  farm = new AntFarm(c.W, c.H, c.ants, c.food);
+  render(farm, ctx);
+  updateStats();
+}
+
+function updateStats() {
+  document.getElementById('sTick').textContent    = farm.tick;
+  document.getElementById('sStored').textContent  = farm.foodStored;
+  document.getElementById('sSurface').textContent = farm.food.size;
+  document.getElementById('sCarrying').textContent= farm.ants.filter(a=>a.hasFood).length;
+}
+
+// Slider live labels
+for (const [sid, vid] of [['sAnts','vAnts'],['sFood','vFood'],['sW','vW'],['sH','vH'],['sSpeed','vSpeed']]) {
+  document.getElementById(sid).addEventListener('input', e => {
+    document.getElementById(vid).textContent = e.target.value;
+    if (sid==='sSpeed') speed = +e.target.value;
+  });
+}
+
+document.getElementById('btnStart').onclick  = () => { running=true;  };
+document.getElementById('btnStop').onclick   = () => { running=false; };
+document.getElementById('btnReset').onclick  = () => { running=false; reset(); };
+document.getElementById('btnFood').onclick   = () => { if(farm) farm.spawnFood(10); };
+
+// Animation loop
+let last=0;
+const MS_PER_TICK = 300;
+
+function loop(ts) {
+  requestAnimationFrame(loop);
+  if (!farm||!running) return;
+  if (ts-last < MS_PER_TICK) return;
+  last=ts;
+  for (let i=0;i<speed;i++) farm.update();
+  render(farm,ctx);
+  updateStats();
+}
+
+reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
+""", height=700, scrolling=False)
