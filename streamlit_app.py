@@ -4,7 +4,7 @@ Streamlit app showing a cross-section of an ant colony.
 Run with:  streamlit run streamlit_app.py
 """
 
-import random, time
+import random
 from dataclasses import dataclass
 from enum import Enum
 import streamlit as st
@@ -289,16 +289,10 @@ if start_btn: st.session_state.running = True
 if stop_btn:  st.session_state.running = False
 if food_btn:  st.session_state.farm._spawn_food(10)
 
+# Store speed in session state so the fragment can read it
+st.session_state.speed = speed
+
 farm: AntFarm = st.session_state.farm
-
-# ── Metrics ───────────────────────────────────────────────────────────────────
-
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Tick",         farm.tick)
-m2.metric("Ants",         len(farm.ants))
-m3.metric("Food stored",  farm.food_stored)
-m4.metric("Food on surface", len(farm.food))
-m5.metric("Carrying",     sum(1 for a in farm.ants if a.has_food))
 
 # ── Renderer ──────────────────────────────────────────────────────────────────
 
@@ -373,14 +367,22 @@ def render_frame(farm: AntFarm) -> Image.Image:
     return img
 
 
-grid_slot = st.empty()
-grid_slot.image(render_frame(farm), width="stretch")
+# ── Simulation fragment (auto-refreshes without WebSocket spam) ───────────────
 
-# ── Loop ──────────────────────────────────────────────────────────────────────
+@st.fragment(run_every=0.35)
+def simulation_view():
+    farm = st.session_state.farm
+    if st.session_state.get("running"):
+        spd = st.session_state.get("speed", 1)
+        for _ in range(spd):
+            farm.update()
 
-if st.session_state.running:
-    for _ in range(speed):
-        farm.update()
-    time.sleep(0.35)
-    grid_slot.image(render_frame(farm), width="stretch")
-    st.rerun()
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Tick",            farm.tick)
+    m2.metric("Ants",            len(farm.ants))
+    m3.metric("Food stored",     farm.food_stored)
+    m4.metric("Food on surface", len(farm.food))
+    m5.metric("Carrying",        sum(1 for a in farm.ants if a.has_food))
+    st.image(render_frame(farm), width="stretch")
+
+simulation_view()
