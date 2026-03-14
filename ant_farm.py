@@ -98,24 +98,45 @@ class AntFarm:
         ant.steps_since_turn += 1
 
         if ant.state == State.SEARCHING:
-            # Follow strongest pheromone with some randomness
-            best_ph = -1
+            # Wander randomly occasionally, or if direction would hit a wall
+            next_x = ant.x + ant.dx
+            next_y = ant.y + ant.dy
+            hit_wall = not self._in_bounds(next_x, next_y)
+            if hit_wall or ant.steps_since_turn > random.randint(4, 10) or random.random() < 0.15:
+                ant._pick_direction()
+
+            # Follow pheromone gradient away from colony (toward food sources):
+            # prefer neighbours whose pheromone is LOWER than current cell,
+            # since trails lead home — going against the gradient finds food.
+            cur_ph = self.grid[ant.y][ant.x].pheromone
+            best_score = -1
             best_nx, best_ny = ant.x + ant.dx, ant.y + ant.dy
             for nx, ny in self._neighbours(ant.x, ant.y):
+                if not self._in_bounds(nx, ny):
+                    continue
                 ph = self.grid[ny][nx].pheromone
-                if ph > best_ph and random.random() < 0.6:
-                    best_ph = ph
+                # Score: mild pheromone presence is attractive, but avoid
+                # cells much stronger than current (those lead to colony).
+                if ph > 0 and ph <= cur_ph * 1.2:
+                    score = ph
+                else:
+                    score = 0
+                if score > best_score and random.random() < 0.5:
+                    best_score = score
                     best_nx, best_ny = nx, ny
 
-            # Wander randomly occasionally
-            if ant.steps_since_turn > random.randint(4, 10) or random.random() < 0.15:
-                ant._pick_direction()
+            # Fall back to current direction if no pheromone found
+            if best_score <= 0:
                 best_nx = ant.x + ant.dx
                 best_ny = ant.y + ant.dy
 
             nx = max(0, min(self.W - 1, best_nx))
             ny = max(0, min(self.H - 1, best_ny))
             ant.x, ant.y = nx, ny
+
+            # If we still didn't move (e.g. clamped to same cell), force new direction
+            if ant.x == nx and ant.y == ny and hit_wall:
+                ant._pick_direction()
 
             # Pick up food
             if self.grid[ant.y][ant.x].has_food:
