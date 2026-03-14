@@ -1,287 +1,402 @@
 """
-Ant Farm – Streamlit UI (self-contained)
+Ant Farm – Side View
+Streamlit app showing a cross-section of an ant colony.
 Run with:  streamlit run streamlit_app.py
 """
 
-import random
-import time
+import random, time
 from dataclasses import dataclass
 from enum import Enum
-
 import streamlit as st
 
-# ── Simulation ────────────────────────────────────────────────────────────────
+# ── Cell types ────────────────────────────────────────────────────────────────
 
-PHEROMONE_DECAY = 0.97
-PHEROMONE_MAX   = 200.0
-FOOD_RESPAWN    = 60
+class Cell(Enum):
+    SKY    = 0
+    GRASS  = 1   # ground surface row
+    DIRT   = 2   # solid underground
+    TUNNEL = 3   # excavated passage
+    NEST   = 4   # colony chamber
 
+# ── Ant states ────────────────────────────────────────────────────────────────
 
-class State(Enum):
-    SEARCHING = "search"
-    CARRYING  = "carry"
+class AntState(Enum):
+    LEAVING   = "leaving"    # underground, heading up to surface
+    FORAGING  = "foraging"   # on surface, hunting for food
+    RETURNING = "returning"  # carrying food, heading back underground
+    IN_NEST   = "in_nest"    # depositing food, then leaving again
 
-
-@dataclass
-class Cell:
-    pheromone: float = 0.0
-    has_food: bool   = False
-
+# ── Ant ───────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Ant:
     x: int
     y: int
-    state: State          = State.SEARCHING
-    dx: int               = 0
-    dy: int               = 0
-    steps_since_turn: int = 0
-    carried_food: bool    = False
+    state: AntState = AntState.LEAVING
+    has_food: bool  = False
+    dx: int         = 1   # surface walk direction
 
-    def __post_init__(self):
-        self._pick_direction()
-
-    def _pick_direction(self):
-        self.dx, self.dy = random.choice(
-            [(0,1),(0,-1),(1,0),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]
-        )
-        self.steps_since_turn = 0
-
+# ── World ─────────────────────────────────────────────────────────────────────
 
 class AntFarm:
     def __init__(self, width: int, height: int, ant_count: int, food_count: int):
-        self.W = width
-        self.H = height
-        self.grid: list[list[Cell]] = [
-            [Cell() for _ in range(width)] for _ in range(height)
-        ]
-        self.colony_x = width  // 2
-        self.colony_y = height // 2
+        self.W, self.H   = width, height
+        self.GROUND_Y    = max(5, height // 6)
+        self.grid        = [[Cell.SKY] * width for _ in range(height)]
+        self.food: set[tuple[int,int]] = set()
+        self.food_stored = 0
+        self.tick        = 0
         self.ants: list[Ant] = []
-        self.food_carried_home = 0
-        self.tick = 0
+        self._build_world()
         self._spawn_food(food_count)
         self._spawn_ants(ant_count)
 
-    def _in_bounds(self, x: int, y: int) -> bool:
+    # ── World building ────────────────────────────────────────────────────────
+
+    def _build_world(self):
+        W, H, GY = self.W, self.H, self.GROUND_Y
+        cx = W // 2
+        self.cx     = cx
+        self.nest_y = GY + max(8, (H - GY) // 3)
+
+        # Underground → DIRT
+        for y in range(GY, H):
+            for x in range(W):
+                self.grid[y][x] = Cell.DIRT
+
+        # Grass surface line
+        for x in range(W):
+            self.grid[GY][x] = Cell.GRASS
+
+        # Nest chamber
+        for dy in range(-2, 3):
+            for dx in range(-6, 7):
+                ny, nx = self.nest_y + dy, cx + dx
+                if GY < ny < H and 0 <= nx < W:
+                    self.grid[ny][nx] = Cell.NEST
+
+        # Main entrance shaft (vertical, centred)
+        for y in range(GY + 1, self.nest_y - 2):
+            self.grid[y][cx] = Cell.TUNNEL
+
+        # Horizontal tunnels left/right from nest
+        branch = W // 4
+        for dx in range(1, branch + 1):
+            for bx in [cx - dx, cx + dx]:
+                if 0 <= bx < W:
+                    self.grid[self.nest_y][bx] = Cell.TUNNEL
+
+        # Secondary shafts + small chambers at branch ends
+        for bx in [cx - branch, cx + branch]:
+            if 0 <= bx < W:
+                for dy in range(1, 5):
+                    ny = self.nest_y + dy
+                    if ny < H:
+                        self.grid[ny][bx] = Cell.TUNNEL
+                for ddx in range(-2, 3):
+                    sx = bx + ddx
+                    ny = min(H - 1, self.nest_y + 4)
+                    if 0 <= sx < W:
+                        self.grid[ny][sx] = Cell.TUNNEL
+
+        # Random rock texture variation stored as a float overlay (for colour only)
+        self._dirt_shade = [
+            [random.uniform(0.85, 1.15) for _ in range(W)]
+            for _ in range(H)
+        ]
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _ok(self, x: int, y: int) -> bool:
         return 0 <= x < self.W and 0 <= y < self.H
 
+    def _passable_surface(self, x: int, y: int) -> bool:
+        return self._ok(x, y) and self.grid[y][x] in (Cell.SKY, Cell.GRASS)
+
+    def _passable_underground(self, x: int, y: int) -> bool:
+        return self._ok(x, y) and self.grid[y][x] in (Cell.TUNNEL, Cell.NEST)
+
+    def _step_toward(self, ax, ay, tx, ty, *, underground: bool) -> tuple[int, int]:
+        """One-step greedy move toward (tx, ty) through passable cells."""
+        passable = self._passable_underground if underground else self._passable_surface
+        ddx = 0 if ax == tx else (1 if tx > ax else -1)
+        ddy = 0 if ay == ty else (1 if ty > ay else -1)
+
+        # Ordered candidates: diagonal first, then axis-aligned, then perpendicular
+        options = [
+            (ax + ddx, ay + ddy),
+            (ax + ddx, ay),
+            (ax,       ay + ddy),
+            (ax - ddy, ay + ddx),
+            (ax + ddy, ay - ddx),
+        ]
+        for nx, ny in options:
+            if passable(nx, ny):
+                return nx, ny
+
+        # Fallback: any passable neighbour
+        nbrs = [(ax+dx, ay+dy) for dx in (-1,0,1) for dy in (-1,0,1)
+                if (dx or dy) and passable(ax+dx, ay+dy)]
+        if nbrs:
+            return random.choice(nbrs)
+        return ax, ay
+
+    # ── Spawning ──────────────────────────────────────────────────────────────
+
     def _spawn_food(self, n: int):
-        placed = 0
-        attempts = 0
-        while placed < n and attempts < n * 20:
-            attempts += 1
+        placed = tries = 0
+        while placed < n and tries < n * 40:
+            tries += 1
             x = random.randint(0, self.W - 1)
-            y = random.randint(0, self.H - 1)
-            dist = abs(x - self.colony_x) + abs(y - self.colony_y)
-            if dist > 5 and not self.grid[y][x].has_food:
-                self.grid[y][x].has_food = True
+            y = random.randint(0, self.GROUND_Y - 1)
+            if (x, y) not in self.food:
+                self.food.add((x, y))
                 placed += 1
 
     def _spawn_ants(self, n: int):
         for _ in range(n):
-            self.ants.append(Ant(x=self.colony_x, y=self.colony_y))
+            x = max(0, min(self.W-1, self.cx + random.randint(-4, 4)))
+            y = max(0, min(self.H-1, self.nest_y + random.randint(-1, 1)))
+            self.ants.append(Ant(x=x, y=y, state=AntState.LEAVING,
+                                 dx=random.choice([-1, 1])))
 
-    def _neighbours(self, x: int, y: int):
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                nx, ny = x + dx, y + dy
-                if self._in_bounds(nx, ny):
-                    yield nx, ny
+    # ── Ant logic ─────────────────────────────────────────────────────────────
 
     def _move_ant(self, ant: Ant):
-        ant.steps_since_turn += 1
+        GY = self.GROUND_Y
 
-        if ant.state == State.SEARCHING:
-            # Pick a new direction if about to hit a wall or time to wander
-            next_x = ant.x + ant.dx
-            next_y = ant.y + ant.dy
-            hit_wall = not self._in_bounds(next_x, next_y)
-            if hit_wall or ant.steps_since_turn > random.randint(4, 10) or random.random() < 0.15:
-                ant._pick_direction()
+        if ant.state == AntState.LEAVING:
+            # Target one cell below grass (GY+1 = top of tunnel), then emerge
+            ant.x, ant.y = self._step_toward(ant.x, ant.y, self.cx, GY + 1,
+                                             underground=True)
+            if ant.y == GY + 1 and ant.x == self.cx:
+                ant.y   = GY          # step onto grass
+                ant.state = AntState.FORAGING
+                ant.dx    = random.choice([-1, 1])
 
-            # Follow pheromone gradient away from colony (toward food):
-            # prefer neighbours with mild pheromone (not stronger than current),
-            # since return trails converge at the colony — going against them finds food.
-            cur_ph = self.grid[ant.y][ant.x].pheromone
-            best_score = -1
-            best_nx, best_ny = ant.x + ant.dx, ant.y + ant.dy
-            for nx, ny in self._neighbours(ant.x, ant.y):
-                ph = self.grid[ny][nx].pheromone
-                if ph > 0 and ph <= cur_ph * 1.2:
-                    score = ph
-                else:
-                    score = 0
-                if score > best_score and random.random() < 0.5:
-                    best_score = score
-                    best_nx, best_ny = nx, ny
+        elif ant.state == AntState.FORAGING:
+            # Wander the surface
+            if random.random() < 0.2:
+                ant.dx = random.choice([-1, -1, 1, 1, 0])
+            ny = GY if random.random() > 0.35 else max(0, GY - random.randint(1, 3))
+            nx = max(0, min(self.W - 1, ant.x + ant.dx))
+            if self._passable_surface(nx, ny):
+                ant.x, ant.y = nx, ny
+            # Bounce off edges
+            if ant.x in (0, self.W - 1):
+                ant.dx = -ant.dx
 
-            if best_score <= 0:
-                best_nx = ant.x + ant.dx
-                best_ny = ant.y + ant.dy
+            # Grab nearby food
+            for fx, fy in list(self.food):
+                if abs(fx - ant.x) <= 1 and abs(fy - ant.y) <= 1:
+                    self.food.discard((fx, fy))
+                    ant.has_food = True
+                    ant.state    = AntState.RETURNING
+                    ant.dx       = -ant.dx
+                    break
 
-            nx = max(0, min(self.W - 1, best_nx))
-            ny = max(0, min(self.H - 1, best_ny))
-            ant.x, ant.y = nx, ny
+        elif ant.state == AntState.RETURNING:
+            if ant.y <= GY:
+                # On surface: walk toward entrance column then descend
+                ant.x, ant.y = self._step_toward(ant.x, ant.y, self.cx, GY,
+                                                 underground=False)
+                if ant.x == self.cx and ant.y == GY:
+                    ant.y = GY + 1    # step into tunnel
+            else:
+                # Underground: head to nest
+                ant.x, ant.y = self._step_toward(ant.x, ant.y, self.cx, self.nest_y,
+                                                 underground=True)
+                if self.grid[ant.y][ant.x] == Cell.NEST:
+                    ant.state    = AntState.IN_NEST
+                    ant.has_food = False
+                    self.food_stored += 1
 
-            # If still stuck at edge, force a new direction next tick
-            if hit_wall and ant.x == nx and ant.y == ny:
-                ant._pick_direction()
-
-            # Pick up food
-            if self.grid[ant.y][ant.x].has_food:
-                self.grid[ant.y][ant.x].has_food = False
-                ant.state = State.CARRYING
-                ant.carried_food = True
-                ant._pick_direction()
-
-        else:  # CARRYING — head home
-            tx, ty = self.colony_x, self.colony_y
-            dx = 0 if ant.x == tx else (1 if tx > ant.x else -1)
-            dy = 0 if ant.y == ty else (1 if ty > ant.y else -1)
+        elif ant.state == AntState.IN_NEST:
+            # Rest briefly in nest, then leave again
             if random.random() < 0.15:
-                dx += random.choice([-1, 0, 1])
-                dy += random.choice([-1, 0, 1])
-            nx = max(0, min(self.W - 1, ant.x + (1 if dx > 0 else -1 if dx < 0 else 0)))
-            ny = max(0, min(self.H - 1, ant.y + (1 if dy > 0 else -1 if dy < 0 else 0)))
-            ant.x, ant.y = nx, ny
+                ant.state = AntState.LEAVING
 
-            cell = self.grid[ant.y][ant.x]
-            cell.pheromone = min(PHEROMONE_MAX, cell.pheromone + 20.0)
+    # ── Digging ───────────────────────────────────────────────────────────────
 
-            if ant.x == self.colony_x and ant.y == self.colony_y:
-                self.food_carried_home += 1
-                ant.carried_food = False
-                ant.state = State.SEARCHING
-                ant._pick_direction()
+    def _dig(self):
+        """Randomly extend tunnels from existing tunnel edges."""
+        if random.random() > 0.04:
+            return
+        # Sample a random underground position
+        y = random.randint(self.GROUND_Y + 1, self.H - 2)
+        x = random.randint(1, self.W - 2)
+        if self.grid[y][x] not in (Cell.TUNNEL, Cell.NEST):
+            return
+        dirs = [(1, 0), (-1, 0), (0, 1)]  # sides and down, not up
+        random.shuffle(dirs)
+        for dx, dy in dirs:
+            nx, ny = x + dx, y + dy
+            if self._ok(nx, ny) and self.grid[ny][nx] == Cell.DIRT:
+                self.grid[ny][nx] = Cell.TUNNEL
+                return
+
+    # ── Update ────────────────────────────────────────────────────────────────
 
     def update(self):
         self.tick += 1
         for ant in self.ants:
             self._move_ant(ant)
-
-        for row in self.grid:
-            for cell in row:
-                cell.pheromone *= PHEROMONE_DECAY
-                if cell.pheromone < 0.5:
-                    cell.pheromone = 0.0
-
-        if self.tick % FOOD_RESPAWN == 0:
-            self._spawn_food(1)
+        self._dig()
+        if self.tick % 60 == 0:
+            self._spawn_food(3)
 
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
+
 st.set_page_config(page_title="Ant Farm", page_icon="🐜", layout="wide")
 
-# ── Sidebar controls ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🐜 Ant Farm")
-    ant_count  = st.slider("Number of ants",       5,  50, 15)
-    food_count = st.slider("Starting food",         5,  60, 20)
-    grid_w     = st.slider("Grid width",           40, 120, 80)
-    grid_h     = st.slider("Grid height",          20,  60, 35)
-    speed      = st.slider("Speed (ticks/frame)",   1,  10,  3)
+    ant_count  = st.slider("Ants",              5,  60, 20)
+    food_count = st.slider("Starting food",     5,  60, 25)
+    grid_w     = st.slider("Width",            50, 140, 90)
+    grid_h     = st.slider("Height",           30,  80, 50)
+    speed      = st.slider("Speed (ticks/frame)", 1, 10, 2)
 
     st.markdown("---")
-    col1, col2 = st.columns(2)
-    start_btn = col1.button("▶ Start",  use_container_width=True)
-    stop_btn  = col2.button("⏹ Stop",   use_container_width=True)
-    reset_btn = st.button("🔄 Reset",   use_container_width=True)
-    food_btn  = st.button("🍎 +5 Food", use_container_width=True)
+    c1, c2 = st.columns(2)
+    start_btn = c1.button("▶ Start",   use_container_width=True)
+    stop_btn  = c2.button("⏹ Stop",    use_container_width=True)
+    reset_btn = st.button("🔄 Reset",  use_container_width=True)
+    food_btn  = st.button("🍎 +10 Food", use_container_width=True)
 
     st.markdown("---")
     st.markdown("""
 **Legend**
-- ⬜ `C` — Colony
-- 🟢 `a` — Ant (searching)
-- 🟡 `@` — Ant (carrying food)
-- 🔴 `*` — Food
-- 🔵 `·` — Pheromone trail
+- 🟦 Sky
+- 🟩 Grass surface
+- 🟫 Dirt (solid)
+- ⬛ Tunnel (open)
+- 🟨 Nest chamber
+- 🔴 Food
+- ⚫ Ant (searching)
+- 🟡 Ant (carrying food)
 """)
 
 # ── Session state ─────────────────────────────────────────────────────────────
+
 if "farm" not in st.session_state or reset_btn:
     st.session_state.farm    = AntFarm(grid_w, grid_h, ant_count, food_count)
     st.session_state.running = False
 
-if start_btn:
-    st.session_state.running = True
-if stop_btn:
-    st.session_state.running = False
-if food_btn:
-    st.session_state.farm._spawn_food(5)
+if start_btn: st.session_state.running = True
+if stop_btn:  st.session_state.running = False
+if food_btn:  st.session_state.farm._spawn_food(10)
 
 farm: AntFarm = st.session_state.farm
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
-m1, m2, m3, m4 = st.columns(4)
+
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Tick",         farm.tick)
 m2.metric("Ants",         len(farm.ants))
-m3.metric("Food at home", farm.food_carried_home)
-carrying = sum(1 for a in farm.ants if a.carried_food)
-m4.metric("Carrying",     carrying)
+m3.metric("Food stored",  farm.food_stored)
+m4.metric("Food on surface", len(farm.food))
+m5.metric("Carrying",     sum(1 for a in farm.ants if a.has_food))
 
-# ── Grid renderer ─────────────────────────────────────────────────────────────
-COLORS = {
-    "ground":  "#1a1a2e",
-    "colony":  "#e0e0e0",
-    "ant_s":   "#44ff88",
-    "ant_c":   "#ffdd00",
-    "food":    "#ff4444",
-    "ph_low":  "#003366",
-    "ph_mid":  "#005599",
-    "ph_high": "#0077cc",
-}
+# ── Renderer ──────────────────────────────────────────────────────────────────
+
+# Base cell colours
+SKY_TOP    = (135, 206, 235)   # light sky blue
+SKY_BOT    = (180, 220, 245)   # near ground, lighter
+GRASS_COL  = (60,  160,  50)
+DIRT_COL   = (101,  67,  33)
+TUNNEL_COL = (35,   20,  10)
+NEST_COL   = (160, 120,  30)
+FOOD_COL   = "#FF3B30"
+ANT_S_COL  = "#111111"
+ANT_C_COL  = "#FFD700"
+
+
+def lerp_colour(c1, c2, t):
+    return tuple(int(a + (b - a) * t) for a, b in zip(c1, c2))
+
+
+def rgb(r, g, b):
+    return f"#{int(r):02x}{int(g):02x}{int(b):02x}"
 
 
 def build_html(farm: AntFarm) -> str:
-    ant_map: dict[tuple[int, int], bool] = {}
+    # Build ant lookup: pos → carrying?
+    ant_map: dict[tuple[int,int], bool] = {}
     for ant in farm.ants:
-        ant_map[(ant.x, ant.y)] = ant_map.get((ant.x, ant.y), False) or ant.carried_food
+        key = (ant.x, ant.y)
+        ant_map[key] = ant_map.get(key, False) or ant.has_food
 
-    cell_px = max(6, min(12, 720 // farm.W))
+    cell_px = max(7, min(13, 900 // farm.W))
+    font_px = max(5, cell_px - 2)
+    GY = farm.GROUND_Y
+
     rows = []
     for gy in range(farm.H):
         cells = []
         for gx in range(farm.W):
-            cell = farm.grid[gy][gx]
-            if gx == farm.colony_x and gy == farm.colony_y:
-                bg, ch, fg = COLORS["colony"], "C", "#000"
-            elif (gx, gy) in ant_map:
-                c = ant_map[(gx, gy)]
-                bg, ch, fg = (COLORS["ant_c"], "@", "#000") if c else (COLORS["ant_s"], "a", "#000")
-            elif cell.has_food:
-                bg, ch, fg = COLORS["food"], "*", "#fff"
-            elif cell.pheromone > 0:
-                t = cell.pheromone / PHEROMONE_MAX
-                bg = COLORS["ph_high"] if t > 0.6 else COLORS["ph_mid"] if t > 0.3 else COLORS["ph_low"]
-                ch, fg = "·", "#aad4ff"
+            ctype = farm.grid[gy][gx]
+            key   = (gx, gy)
+
+            # Background colour
+            if ctype == Cell.SKY:
+                t  = gy / max(1, GY)
+                bg = rgb(*lerp_colour(SKY_TOP, SKY_BOT, t))
+            elif ctype == Cell.GRASS:
+                # Slight texture variation
+                v  = int(60 + (gx * 7 + gy * 3) % 20)
+                bg = rgb(30, v + 80, 30)
+            elif ctype == Cell.DIRT:
+                s  = farm._dirt_shade[gy][gx]
+                bg = rgb(*(min(255, int(c * s)) for c in DIRT_COL))
+            elif ctype == Cell.TUNNEL:
+                bg = rgb(*TUNNEL_COL)
+            elif ctype == Cell.NEST:
+                s  = 0.9 + 0.2 * ((gx + gy) % 2)
+                bg = rgb(*(min(255, int(c * s)) for c in NEST_COL))
             else:
-                bg, ch, fg = COLORS["ground"], " ", "#333"
+                bg = "#000"
+
+            # Foreground content
+            if key in ant_map:
+                ch = "●"
+                fg = ANT_C_COL if ant_map[key] else ANT_S_COL
+            elif key in farm.food:
+                ch = "●"
+                fg = FOOD_COL
+            elif ctype == Cell.GRASS:
+                # Draw little grass blades every few columns
+                ch = "|" if gx % 4 == 0 else " "
+                fg = rgb(20, 200, 20)
+            else:
+                ch = " "
+                fg = "#000"
 
             cells.append(
-                f'<td style="background:{bg};color:{fg};width:{cell_px}px;height:{cell_px}px;'
-                f'font-size:{max(6, cell_px - 2)}px;text-align:center;vertical-align:middle;'
-                f'padding:0;font-family:monospace;line-height:1;">{ch}</td>'
+                f'<td style="background:{bg};color:{fg};width:{cell_px}px;'
+                f'height:{cell_px}px;font-size:{font_px}px;text-align:center;'
+                f'vertical-align:middle;padding:0;line-height:1;">{ch}</td>'
             )
         rows.append("<tr>" + "".join(cells) + "</tr>")
 
     table = (
-        '<table style="border-collapse:collapse;margin:auto;background:#1a1a2e;border:2px solid #444;">'
-        + "".join(rows) + "</table>"
+        '<table style="border-collapse:collapse;margin:0 auto;'
+        'border:2px solid #555;">'
+        + "".join(rows)
+        + "</table>"
     )
-    return f'<div style="overflow:auto;max-height:75vh;">{table}</div>'
+    return f'<div style="overflow:auto;">{table}</div>'
 
 
 grid_slot = st.empty()
 grid_slot.markdown(build_html(farm), unsafe_allow_html=True)
 
-# ── Simulation loop ───────────────────────────────────────────────────────────
+# ── Loop ──────────────────────────────────────────────────────────────────────
+
 if st.session_state.running:
     for _ in range(speed):
         farm.update()
-    time.sleep(0.05)
+    time.sleep(0.06)
     grid_slot.markdown(build_html(farm), unsafe_allow_html=True)
     st.rerun()
